@@ -1,0 +1,328 @@
+name: Reusable Security Gate
+
+# Reusable CI/CD security gate. Call from any repo via `workflow_call`.
+#
+# Pipeline:
+#   detect       -> figures out which stacks/languages the caller repo uses
+#   secrets-scan -> Gitleaks (full git history, findings always fail the gate)
+#   sast         -> Semgrep (multi-language static analysis, severity-gated)
+#   sca          -> OSV-Scanner (dependency vulnerabilities, CVSS-gated)
+#   iac          -> Checkov (Terraform / CloudFormation / K8s / Helm / Dockerfile)
+#   gate         -> aggregates results into a single required check
+#
+# Scanners are installed from pinned official releases / official images
+# rather than third-party wrapper actions (trivy-action and setup-trivy were
+# compromised in March 2026 — avoid marketplace wrappers for security tooling).
+
+on:
+  workflow_call:
+    inputs:
+      scan-path:
+        description: "Path within the caller repo to scan"
+        type: string
+        default: "."
+      fail-on-severity:
+        description: "Minimum severity that fails the gate: critical | high | medium | low"
+        type: string
+        default: "high"
+      semgrep-rulesets:
+        description: "Space-separated Semgrep registry rulesets (ignored when SEMGREP_APP_TOKEN is set)"
+        type: string
+        default: "p/default p/owasp-top-ten p/secrets"
+      semgrep-custom-rules:
+        description: "Path (in the caller repo) to a directory or file of extra Semgrep rules; used only if it exists"
+        type: string
+        default: "semgrep-rules"
+      gitleaks-config:
+        description: "Path (in the caller repo) to a gitleaks.toml; used only if it exists"
+        type: string
+        default: "gitleaks.toml"
+      enable-secrets-scan:
+        type: boolean
+        default: true
+      enable-sast:
+        type: boolean
+        default: true
+      enable-sca:
+        type: boolean
+        default: true
+      enable-iac:
+        type: boolean
+        default: true
+      upload-sarif:
+        description: "Upload SARIF to GitHub code scanning (needs security-events: write; ignored gracefully if unavailable)"
+        type: boolean
+        default: true
+    secrets:
+      SEMGREP_APP_TOKEN:
+        required: false
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+
+jobs:
+  detect:
+    name: Detect stacks & severity threshold
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      stacks: ${{ steps.d.outputs.stacks }}
+      has_iac: ${{ steps.d.outputs.has_iac }}
+      semgrep_sev_flags: ${{ steps.sev.outputs.semgrep_flags }}
+      min_cvss: ${{ steps.sev.outputs.min_cvss }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: sev
+        name: Map fail-on-severity to per-tool thresholds
+        run: |
+          case "${{ inputs.fail-on-severity }}" in
+            critical) min_cvss="9.0"; semgrep_flags="--severity ERROR" ;;
+            high)     min_cvss="7.0"; semgrep_flags="--severity ERROR" ;;
+            medium)   min_cvss="4.0"; semgrep_flags="--severity ERROR --severity WARNING" ;;
+            low)      min_cvss="0.1"; semgrep_flags="" ;;
+            *) echo "::error::Invalid fail-on-severity '${{ inputs.fail-on-severity }}' (use critical|high|medium|low)"; exit 1 ;;
+          esac
+          echo "min_cvss=$min_cvss"        >> "$GITHUB_OUTPUT"
+          echo "semgrep_flags=$semgrep_flags" >> "$GITHUB_OUTPUT"
+
+      - id: d
+        name: Detect languages and IaC
+        working-directory: ${{ inputs.scan-path }}
+        run: |
+          f() { find . \( -path './.git' -o -path '*/node_modules' -o -path '*/vendor' \) -prune -o -iname "$1" -print -quit | grep -q . ; }
+          stacks=""
+          add() { stacks="${stacks:+$stacks, }$1"; }
+
+          { f 'pyproject.toml' || f 'requirements*.txt' || f 'setup.py' || f 'Pipfile'; } && add python
+          f 'package.json'   && add node
+          f 'go.mod'         && add go
+          { f 'pom.xml' || f 'build.gradle*'; } && add java
+          f 'Gemfile'        && add ruby
+          f 'composer.json'  && add php
+          f 'Cargo.toml'     && add rust
+          { f '*.csproj' || f '*.sln'; } && add dotnet
+
+          has_iac=false
+          f 'Dockerfile*'    && { add docker; has_iac=true; }
+          f 'Containerfile'  && { add docker; has_iac=true; }
+          f '*.tf'           && { add terraform; has_iac=true; }
+          f 'Chart.yaml'     && { add helm; has_iac=true; }
+          if grep -rElm1 --include='*.yml' --include='*.yaml' --exclude-dir=.git --exclude-dir=node_modules '^(apiVersion:|AWSTemplateFormatVersion)' . | grep -q .; then
+            add k8s-or-cfn; has_iac=true
+          fi
+
+          echo "stacks=${stacks:-none detected}" >> "$GITHUB_OUTPUT"
+          echo "has_iac=$has_iac"                >> "$GITHUB_OUTPUT"
+          {
+            echo "### Security gate"
+            echo "- **Detected stacks:** ${stacks:-none detected}"
+            echo "- **Fail threshold:** ${{ inputs.fail-on-severity }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  secrets-scan:
+    name: Secrets (Gitleaks)
+    if: ${{ inputs.enable-secrets-scan }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # scan the full history, not just HEAD
+
+      - name: Run Gitleaks
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | tar -xz gitleaks
+          args=(git --redact --exit-code 1 --report-format sarif --report-path gitleaks.sarif .)
+          if [ -f "${{ inputs.gitleaks-config }}" ]; then
+            args+=(--config "${{ inputs.gitleaks-config }}")
+          fi
+          ./gitleaks "${args[@]}"
+
+      - name: Upload SARIF to code scanning
+        if: ${{ always() && inputs.upload-sarif }}
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: gitleaks.sarif
+          category: security-gate-gitleaks
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-gate-gitleaks-report
+          path: gitleaks.sarif
+          if-no-files-found: ignore
+
+  sast:
+    name: SAST (Semgrep)
+    if: ${{ inputs.enable-sast }}
+    needs: detect
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: semgrep/semgrep   # official image; pin a version tag for stricter supply-chain control
+    env:
+      SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run Semgrep
+        run: |
+          sev_flags='${{ needs.detect.outputs.semgrep_sev_flags }}'
+          if [ -n "$SEMGREP_APP_TOKEN" ]; then
+            # Logged-in mode: rules/policies come from the Semgrep AppSec Platform
+            semgrep ci $sev_flags --sarif --output semgrep.sarif
+          else
+            cfg=""
+            for r in ${{ inputs.semgrep-rulesets }}; do cfg="$cfg --config $r"; done
+            if [ -e "${{ inputs.semgrep-custom-rules }}" ]; then
+              cfg="$cfg --config ${{ inputs.semgrep-custom-rules }}"
+            fi
+            semgrep scan $cfg $sev_flags --error --metrics=off \
+              --sarif --output semgrep.sarif "${{ inputs.scan-path }}"
+          fi
+
+      - name: Upload SARIF to code scanning
+        if: ${{ always() && inputs.upload-sarif }}
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: semgrep.sarif
+          category: security-gate-semgrep
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-gate-semgrep-report
+          path: semgrep.sarif
+          if-no-files-found: ignore
+
+  sca:
+    name: Dependencies (OSV-Scanner)
+    if: ${{ inputs.enable-sca }}
+    needs: detect
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run OSV-Scanner
+        run: |
+          curl -sSfL "https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64" -o osv-scanner
+          chmod +x osv-scanner
+
+          ec=0
+          ./osv-scanner scan source --recursive --format json --output osv.json "${{ inputs.scan-path }}" || ec=$?
+          ./osv-scanner scan source --recursive --format sarif --output osv.sarif "${{ inputs.scan-path }}" || true
+
+          # 0 = clean, 1 = vulns found (gate below by CVSS), 128 = no packages found
+          if [ "$ec" = "0" ] || [ "$ec" = "128" ]; then
+            echo "No known vulnerabilities (or no supported package manifests) found."
+            exit 0
+          elif [ "$ec" != "1" ]; then
+            echo "::error::osv-scanner failed with exit code $ec"
+            exit "$ec"
+          fi
+
+          # Gate on CVSS >= threshold; vulns with no recorded severity are treated as failing (conservative).
+          count=$(jq --argjson min '${{ needs.detect.outputs.min_cvss }}' '
+            [ .results[]?.packages[]?.groups[]?
+              | (.max_severity // "") as $s
+              | select($s == "" or (($s | tonumber? // 10) >= $min)) ] | length' osv.json)
+          total=$(jq '[ .results[]?.packages[]?.groups[]? ] | length' osv.json)
+          echo "Vulnerability groups found: $total; at or above threshold (CVSS >= ${{ needs.detect.outputs.min_cvss }}): $count"
+          if [ "$count" -gt 0 ]; then
+            echo "::error::$count dependency vulnerability group(s) at or above the '${{ inputs.fail-on-severity }}' threshold"
+            exit 1
+          fi
+
+      - name: Upload SARIF to code scanning
+        if: ${{ always() && inputs.upload-sarif }}
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: osv.sarif
+          category: security-gate-osv
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-gate-osv-report
+          path: |
+            osv.json
+            osv.sarif
+          if-no-files-found: ignore
+
+  iac:
+    name: IaC (Checkov)
+    if: ${{ inputs.enable-iac && needs.detect.outputs.has_iac == 'true' }}
+    needs: detect
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run Checkov
+        run: |
+          pipx install checkov
+          checkov --directory "${{ inputs.scan-path }}" \
+            --framework terraform cloudformation kubernetes helm dockerfile \
+            -o cli -o sarif --output-file-path console,. \
+            --quiet --compact
+          mv results.sarif checkov.sarif 2>/dev/null || true
+
+      - name: Upload SARIF to code scanning
+        if: ${{ always() && inputs.upload-sarif }}
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: checkov.sarif
+          category: security-gate-checkov
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-gate-checkov-report
+          path: checkov.sarif
+          if-no-files-found: ignore
+
+  gate:
+    name: Security gate result
+    needs: [detect, secrets-scan, sast, sca, iac]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Evaluate results
+        run: |
+          declare -A results=(
+            ["Stack detection"]="${{ needs.detect.result }}"
+            ["Secrets (Gitleaks)"]="${{ needs['secrets-scan'].result }}"
+            ["SAST (Semgrep)"]="${{ needs.sast.result }}"
+            ["Dependencies (OSV-Scanner)"]="${{ needs.sca.result }}"
+            ["IaC (Checkov)"]="${{ needs.iac.result }}"
+          )
+          {
+            echo "### Security gate results (threshold: ${{ inputs.fail-on-severity }})"
+            echo ""
+            echo "| Check | Result |"
+            echo "|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          failed=0
+          for name in "Stack detection" "Secrets (Gitleaks)" "SAST (Semgrep)" "Dependencies (OSV-Scanner)" "IaC (Checkov)"; do
+            r="${results[$name]}"
+            case "$r" in
+              success) icon="✅ passed" ;;
+              skipped) icon="⏭️ skipped" ;;
+              *)       icon="❌ $r"; failed=1 ;;
+            esac
+            echo "| $name | $icon |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::Security gate failed — see individual scan jobs and the Security tab for findings."
+            exit 1
+          fi
+          echo "Security gate passed."

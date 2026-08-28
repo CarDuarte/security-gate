@@ -1,0 +1,22 @@
+# Copy this file into a project as .github/workflows/security.yml
+name: Security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write   # lets scan results appear in the repo's Security tab
+  actions: read
+
+jobs:
+  security-gate:
+    uses: CarDuarte/security-gate/.github/workflows/reusable-security-gate.yml@main
+    with:
+      fail-on-severity: high
+      # scan-path: "."
+      # enable-iac: false
+    secrets:
+      SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}   # optional; remove if unused
