@@ -6,13 +6,20 @@ on:
   push:
     branches: [main]
 
+# One run per branch/PR at a time; a new push cancels the superseded run.
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Minimal token permissions. The called workflow can only reduce these, never add to them.
 permissions:
   contents: read
-  security-events: write   # lets scan results appear in the repo's Security tab
-  actions: read
+  security-events: write   # lets scan results appear in the repo's Security tab (drop if upload-sarif: false)
+  actions: read            # needed by the SARIF upload on private repos
 
 jobs:
   security-gate:
+    # For stronger supply-chain guarantees, replace @main with a full commit SHA of this repo.
     uses: CarDuarte/security-gate/.github/workflows/reusable-security-gate.yml@main
     with:
       fail-on-severity: high

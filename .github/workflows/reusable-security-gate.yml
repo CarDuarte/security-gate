@@ -10,15 +10,25 @@ name: Reusable Security Gate
 #   iac          -> Checkov (Terraform / CloudFormation / K8s / Helm / Dockerfile)
 #   gate         -> aggregates results into a single required check
 #
-# Scanners are installed from pinned official releases / official images
-# rather than third-party wrapper actions (trivy-action and setup-trivy were
-# compromised in March 2026 — avoid marketplace wrappers for security tooling).
+# Supply chain:
+#   * Every third-party action is pinned to a full commit SHA (the tag is kept
+#     in a trailing comment for readability). Moving tags were the attack
+#     vector in the March 2026 trivy-action / setup-trivy compromise.
+#   * Scanner binaries are downloaded from official GitHub releases at a fixed
+#     version and verified against a hard-coded SHA-256 before use.
+#   * The Semgrep container image is pinned to a release tag AND its digest.
+#   * Checkov is installed from PyPI at a fixed version.
+#   Bump versions in the `env` block below (and the Semgrep image on the `sast`
+#   job); the README "Supply chain" section explains where to find checksums.
+#
+# Shell safety: workflow inputs are never interpolated into `run:` scripts.
+# They are passed through `env:` and referenced as quoted shell variables.
 
 on:
   workflow_call:
     inputs:
       scan-path:
-        description: "Path within the caller repo to scan"
+        description: "Path within the caller repo to scan (Semgrep scan mode, OSV-Scanner, Checkov). Gitleaks and `semgrep ci` always scan the whole repo."
         type: string
         default: "."
       fail-on-severity:
@@ -30,7 +40,7 @@ on:
         type: string
         default: "p/default p/owasp-top-ten p/secrets"
       semgrep-custom-rules:
-        description: "Path (in the caller repo) to a directory or file of extra Semgrep rules; used only if it exists"
+        description: "Path (in the caller repo) to a directory or file of extra Semgrep rules; used only if it exists (ignored when SEMGREP_APP_TOKEN is set)"
         type: string
         default: "semgrep-rules"
       gitleaks-config:
@@ -57,31 +67,47 @@ on:
       SEMGREP_APP_TOKEN:
         required: false
 
+# Single place to bump scanner versions. Update the checksum together with the
+# version - the checksum is what actually protects the download.
 env:
   GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"   # gitleaks_8.30.1_linux_x64.tar.gz
+  OSV_SCANNER_VERSION: "2.5.1"
+  OSV_SCANNER_SHA256: "f9f25499a2c8cc367b3af45df2ea7eeca7fbccceab9c35079968f4b3652194be"   # osv-scanner_linux_amd64
+  CHECKOV_VERSION: "3.3.16"
+  # Semgrep: the image tag + digest live on `jobs.sast.container.image` because
+  # the `env` context is not available there.
+
+defaults:
+  run:
+    shell: bash   # bash -eo pipefail, explicitly, in every job (including the Semgrep container)
 
 jobs:
   detect:
     name: Detect stacks & severity threshold
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
     outputs:
       stacks: ${{ steps.d.outputs.stacks }}
       has_iac: ${{ steps.d.outputs.has_iac }}
       semgrep_sev_flags: ${{ steps.sev.outputs.semgrep_flags }}
       min_cvss: ${{ steps.sev.outputs.min_cvss }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
 
       - id: sev
         name: Map fail-on-severity to per-tool thresholds
+        env:
+          FAIL_ON_SEVERITY: ${{ inputs.fail-on-severity }}
         run: |
-          case "${{ inputs.fail-on-severity }}" in
+          case "$FAIL_ON_SEVERITY" in
             critical) min_cvss="9.0"; semgrep_flags="--severity ERROR" ;;
             high)     min_cvss="7.0"; semgrep_flags="--severity ERROR" ;;
             medium)   min_cvss="4.0"; semgrep_flags="--severity ERROR --severity WARNING" ;;
             low)      min_cvss="0.1"; semgrep_flags="" ;;
-            *) echo "::error::Invalid fail-on-severity '${{ inputs.fail-on-severity }}' (use critical|high|medium|low)"; exit 1 ;;
+            *) echo "::error::Invalid fail-on-severity '$FAIL_ON_SEVERITY' (use critical|high|medium|low)"; exit 1 ;;
           esac
           echo "min_cvss=$min_cvss"        >> "$GITHUB_OUTPUT"
           echo "semgrep_flags=$semgrep_flags" >> "$GITHUB_OUTPUT"
@@ -89,8 +115,12 @@ jobs:
       - id: d
         name: Detect languages and IaC
         working-directory: ${{ inputs.scan-path }}
+        env:
+          FAIL_ON_SEVERITY: ${{ inputs.fail-on-severity }}
         run: |
-          f() { find . \( -path './.git' -o -path '*/node_modules' -o -path '*/vendor' \) -prune -o -iname "$1" -print -quit | grep -q . ; }
+          # f NAME -> true if any file matching NAME exists (skipping .git, node_modules, vendor).
+          # Uses $(...) rather than "| grep -q" so pipefail cannot turn an early exit into a miss.
+          f() { [ -n "$(find . \( -path './.git' -o -path '*/node_modules' -o -path '*/vendor' \) -prune -o -iname "$1" -print -quit)" ]; }
           stacks=""
           add() { stacks="${stacks:+$stacks, }$1"; }
 
@@ -108,7 +138,9 @@ jobs:
           f 'Containerfile'  && { add docker; has_iac=true; }
           f '*.tf'           && { add terraform; has_iac=true; }
           f 'Chart.yaml'     && { add helm; has_iac=true; }
-          if grep -rElm1 --include='*.yml' --include='*.yaml' --exclude-dir=.git --exclude-dir=node_modules '^(apiVersion:|AWSTemplateFormatVersion)' . | grep -q .; then
+          k8s_or_cfn=$(grep -rEl --include='*.yml' --include='*.yaml' --exclude-dir=.git --exclude-dir=node_modules \
+                         '^(apiVersion:|AWSTemplateFormatVersion)' . 2>/dev/null | head -n1 || true)
+          if [ -n "$k8s_or_cfn" ]; then
             add k8s-or-cfn; has_iac=true
           fi
 
@@ -117,7 +149,7 @@ jobs:
           {
             echo "### Security gate"
             echo "- **Detected stacks:** ${stacks:-none detected}"
-            echo "- **Fail threshold:** ${{ inputs.fail-on-severity }}"
+            echo "- **Fail threshold:** $FAIL_ON_SEVERITY"
           } >> "$GITHUB_STEP_SUMMARY"
 
   secrets-scan:
@@ -125,29 +157,45 @@ jobs:
     if: ${{ inputs.enable-secrets-scan }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # No `permissions:` on the scan jobs: a called workflow may only reduce the
+    # caller's grant, and requesting `security-events: write` when the caller did
+    # not grant it fails the job outright. Callers set the minimal set (see
+    # README); `upload-sarif` degrades gracefully when the permission is missing.
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
         with:
           fetch-depth: 0   # scan the full history, not just HEAD
 
-      - name: Run Gitleaks
+      - name: Install Gitleaks (pinned, checksum-verified)
         run: |
-          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | tar -xz gitleaks
+          install -d "$RUNNER_TEMP/gitleaks"
+          curl --proto '=https' --tlsv1.2 -sSfL --retry 3 \
+            -o "$RUNNER_TEMP/gitleaks/gitleaks.tar.gz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  ${RUNNER_TEMP}/gitleaks/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gitleaks/gitleaks.tar.gz" -C "$RUNNER_TEMP/gitleaks" gitleaks
+          echo "$RUNNER_TEMP/gitleaks" >> "$GITHUB_PATH"
+
+      - name: Run Gitleaks
+        env:
+          GITLEAKS_CONFIG_PATH: ${{ inputs.gitleaks-config }}   # not GITLEAKS_CONFIG: that name is read by gitleaks itself
+        run: |
+          # Scans the whole repository history; `scan-path` does not apply here.
           args=(git --redact --exit-code 1 --report-format sarif --report-path gitleaks.sarif .)
-          if [ -f "${{ inputs.gitleaks-config }}" ]; then
-            args+=(--config "${{ inputs.gitleaks-config }}")
+          if [ -f "$GITLEAKS_CONFIG_PATH" ]; then
+            args+=(--config "$GITLEAKS_CONFIG_PATH")
           fi
-          ./gitleaks "${args[@]}"
+          gitleaks "${args[@]}"
 
       - name: Upload SARIF to code scanning
         if: ${{ always() && inputs.upload-sarif }}
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938   # v4.37.9
         with:
           sarif_file: gitleaks.sarif
           category: security-gate-gitleaks
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
         if: always()
         with:
           name: security-gate-gitleaks-report
@@ -161,37 +209,48 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     container:
-      image: semgrep/semgrep   # official image; pin a version tag for stricter supply-chain control
+      # Official image, pinned to a release tag and its multi-arch index digest.
+      # Alpine-based, runs as root, ships git and bash; the runner provides a musl
+      # Node build so actions/checkout works inside it (Semgrep's documented setup).
+      image: semgrep/semgrep:1.176.0@sha256:12672acdb0949e19f9f6a4c2b288edd0b404f268f0ca7738a2c06f372f50362e
     env:
       SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
 
       - name: Run Semgrep
+        env:
+          SEMGREP_SEV_FLAGS: ${{ needs.detect.outputs.semgrep_sev_flags }}
+          SEMGREP_RULESETS: ${{ inputs.semgrep-rulesets }}
+          SEMGREP_CUSTOM_RULES: ${{ inputs.semgrep-custom-rules }}
+          SCAN_PATH: ${{ inputs.scan-path }}
         run: |
-          sev_flags='${{ needs.detect.outputs.semgrep_sev_flags }}'
+          read -ra sev_flags <<< "$SEMGREP_SEV_FLAGS"
           if [ -n "$SEMGREP_APP_TOKEN" ]; then
-            # Logged-in mode: rules/policies come from the Semgrep AppSec Platform
-            semgrep ci $sev_flags --sarif --output semgrep.sarif
+            # Logged-in mode: rules/policies come from the Semgrep AppSec Platform.
+            # `semgrep ci` always scans the whole checkout; scan-path, rulesets and
+            # custom rules do not apply in this mode.
+            semgrep ci "${sev_flags[@]}" --sarif --output semgrep.sarif
           else
-            cfg=""
-            for r in ${{ inputs.semgrep-rulesets }}; do cfg="$cfg --config $r"; done
-            if [ -e "${{ inputs.semgrep-custom-rules }}" ]; then
-              cfg="$cfg --config ${{ inputs.semgrep-custom-rules }}"
+            cfg=()
+            read -ra rulesets <<< "$SEMGREP_RULESETS"
+            for r in "${rulesets[@]}"; do cfg+=(--config "$r"); done
+            if [ -e "$SEMGREP_CUSTOM_RULES" ]; then
+              cfg+=(--config "$SEMGREP_CUSTOM_RULES")
             fi
-            semgrep scan $cfg $sev_flags --error --metrics=off \
-              --sarif --output semgrep.sarif "${{ inputs.scan-path }}"
+            semgrep scan "${cfg[@]}" "${sev_flags[@]}" --error --metrics=off \
+              --sarif --output semgrep.sarif "$SCAN_PATH"
           fi
 
       - name: Upload SARIF to code scanning
         if: ${{ always() && inputs.upload-sarif }}
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938   # v4.37.9
         with:
           sarif_file: semgrep.sarif
           category: security-gate-semgrep
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
         if: always()
         with:
           name: security-gate-semgrep-report
@@ -205,16 +264,31 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+
+      - name: Install OSV-Scanner (pinned, checksum-verified)
+        run: |
+          install -d "$RUNNER_TEMP/osv"
+          curl --proto '=https' --tlsv1.2 -sSfL --retry 3 \
+            -o "$RUNNER_TEMP/osv/osv-scanner" \
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SCANNER_SHA256}  ${RUNNER_TEMP}/osv/osv-scanner" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/osv/osv-scanner"
+          echo "$RUNNER_TEMP/osv" >> "$GITHUB_PATH"
 
       - name: Run OSV-Scanner
+        env:
+          SCAN_PATH: ${{ inputs.scan-path }}
+          MIN_CVSS: ${{ needs.detect.outputs.min_cvss }}
+          FAIL_ON_SEVERITY: ${{ inputs.fail-on-severity }}
         run: |
-          curl -sSfL "https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64" -o osv-scanner
-          chmod +x osv-scanner
-
+          # OSV-Scanner accepts a single --format per run, so it runs twice: the JSON
+          # drives the CVSS gate below, the SARIF feeds code scanning. Both runs query
+          # the osv.dev API; the second one is best-effort.
           ec=0
-          ./osv-scanner scan source --recursive --format json --output osv.json "${{ inputs.scan-path }}" || ec=$?
-          ./osv-scanner scan source --recursive --format sarif --output osv.sarif "${{ inputs.scan-path }}" || true
+          osv-scanner scan source --recursive --format json --output osv.json "$SCAN_PATH" || ec=$?
+          osv-scanner scan source --recursive --format sarif --output osv.sarif "$SCAN_PATH" \
+            || echo "::warning::osv-scanner SARIF run exited $? - no SARIF will be uploaded for this scan"
 
           # 0 = clean, 1 = vulns found (gate below by CVSS), 128 = no packages found
           if [ "$ec" = "0" ] || [ "$ec" = "128" ]; then
@@ -226,26 +300,27 @@ jobs:
           fi
 
           # Gate on CVSS >= threshold; vulns with no recorded severity are treated as failing (conservative).
-          count=$(jq --argjson min '${{ needs.detect.outputs.min_cvss }}' '
-            [ .results[]?.packages[]?.groups[]?
+          count=$(jq --arg min "$MIN_CVSS" '
+            ($min | tonumber) as $min
+            | [ .results[]?.packages[]?.groups[]?
               | (.max_severity // "") as $s
               | select($s == "" or (($s | tonumber? // 10) >= $min)) ] | length' osv.json)
           total=$(jq '[ .results[]?.packages[]?.groups[]? ] | length' osv.json)
-          echo "Vulnerability groups found: $total; at or above threshold (CVSS >= ${{ needs.detect.outputs.min_cvss }}): $count"
+          echo "Vulnerability groups found: $total; at or above threshold (CVSS >= $MIN_CVSS): $count"
           if [ "$count" -gt 0 ]; then
-            echo "::error::$count dependency vulnerability group(s) at or above the '${{ inputs.fail-on-severity }}' threshold"
+            echo "::error::$count dependency vulnerability group(s) at or above the '$FAIL_ON_SEVERITY' threshold"
             exit 1
           fi
 
       - name: Upload SARIF to code scanning
         if: ${{ always() && inputs.upload-sarif }}
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938   # v4.37.9
         with:
           sarif_file: osv.sarif
           category: security-gate-osv
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
         if: always()
         with:
           name: security-gate-osv-report
@@ -261,26 +336,33 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+
+      - name: Install Checkov (pinned)
+        run: pipx install "checkov==${CHECKOV_VERSION}"
 
       - name: Run Checkov
+        env:
+          SCAN_PATH: ${{ inputs.scan-path }}
         run: |
-          pipx install checkov
-          checkov --directory "${{ inputs.scan-path }}" \
+          # --output-file-path pairs positionally with the -o formats:
+          #   cli -> console, sarif -> checkov.sarif
+          # Checkov writes the SARIF before exiting, then exits 1 on failed checks,
+          # which fails this step; the always() steps below still find the report.
+          checkov --directory "$SCAN_PATH" \
             --framework terraform cloudformation kubernetes helm dockerfile \
-            -o cli -o sarif --output-file-path console,. \
+            -o cli -o sarif --output-file-path console,checkov.sarif \
             --quiet --compact
-          mv results.sarif checkov.sarif 2>/dev/null || true
 
       - name: Upload SARIF to code scanning
         if: ${{ always() && inputs.upload-sarif }}
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938   # v4.37.9
         with:
           sarif_file: checkov.sarif
           category: security-gate-checkov
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
         if: always()
         with:
           name: security-gate-checkov-report
@@ -293,18 +375,26 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions: {}   # no checkout, no API calls: needs nothing
     steps:
       - name: Evaluate results
+        env:
+          FAIL_ON_SEVERITY: ${{ inputs.fail-on-severity }}
+          RESULT_DETECT: ${{ needs.detect.result }}
+          RESULT_SECRETS: ${{ needs['secrets-scan'].result }}
+          RESULT_SAST: ${{ needs.sast.result }}
+          RESULT_SCA: ${{ needs.sca.result }}
+          RESULT_IAC: ${{ needs.iac.result }}
         run: |
           declare -A results=(
-            ["Stack detection"]="${{ needs.detect.result }}"
-            ["Secrets (Gitleaks)"]="${{ needs['secrets-scan'].result }}"
-            ["SAST (Semgrep)"]="${{ needs.sast.result }}"
-            ["Dependencies (OSV-Scanner)"]="${{ needs.sca.result }}"
-            ["IaC (Checkov)"]="${{ needs.iac.result }}"
+            ["Stack detection"]="$RESULT_DETECT"
+            ["Secrets (Gitleaks)"]="$RESULT_SECRETS"
+            ["SAST (Semgrep)"]="$RESULT_SAST"
+            ["Dependencies (OSV-Scanner)"]="$RESULT_SCA"
+            ["IaC (Checkov)"]="$RESULT_IAC"
           )
           {
-            echo "### Security gate results (threshold: ${{ inputs.fail-on-severity }})"
+            echo "### Security gate results (threshold: $FAIL_ON_SEVERITY)"
             echo ""
             echo "| Check | Result |"
             echo "|---|---|"
@@ -322,7 +412,7 @@ jobs:
           done
 
           if [ "$failed" -ne 0 ]; then
-            echo "::error::Security gate failed — see individual scan jobs and the Security tab for findings."
+            echo "::error::Security gate failed - see individual scan jobs and the Security tab for findings."
             exit 1
           fi
           echo "Security gate passed."

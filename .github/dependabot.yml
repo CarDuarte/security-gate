@@ -1,0 +1,22 @@
+# Keeps the SHA-pinned `uses:` lines in .github/workflows current.
+# Dependabot bumps the commit hash and rewrites the trailing "# vX.Y.Z" comment,
+# so the pin stays a full SHA, never a moving tag.
+#
+# It does NOT cover the scanner binaries/images pinned in the workflow's `env`
+# block and on the Semgrep `container:` line (Gitleaks, OSV-Scanner, Checkov,
+# Semgrep). Those are bumped by hand; see README "Bumping a version".
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"          # covers .github/workflows/*.yml
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    groups:
+      github-actions:       # one PR per week for all action bumps instead of one per action
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - "dependencies"
+      - "github-actions"
