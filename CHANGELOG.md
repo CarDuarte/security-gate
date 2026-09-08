@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — 2026-09-08 security review
+## Released — 2026-09-08 security review
 
 A review of `reusable-security-gate.yml` produced the findings below. Each was
 checked against the file and, where it mattered, against the upstream tool source.
