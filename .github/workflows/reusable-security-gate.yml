@@ -197,6 +197,13 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
         if: always()
+        # The report artifact is a convenience copy; the SARIF already reached
+        # code scanning in the previous step. An artifact-service error (seen
+        # 2026-09-08 on CarDuarte/password-manager main: "Failed to
+        # FinalizeArtifact ... (403) Forbidden: Error from intermediary" after
+        # a clean Gitleaks scan) must not turn a passing scan into a failed
+        # gate. The scan step above still fails the job on real findings.
+        continue-on-error: true
         with:
           name: security-gate-gitleaks-report
           path: gitleaks.sarif
@@ -252,6 +259,13 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
         if: always()
+        # The report artifact is a convenience copy; the SARIF already reached
+        # code scanning in the previous step. An artifact-service error (seen
+        # 2026-09-08 on CarDuarte/password-manager main: "Failed to
+        # FinalizeArtifact ... (403) Forbidden: Error from intermediary" after
+        # a clean Gitleaks scan) must not turn a passing scan into a failed
+        # gate. The scan step above still fails the job on real findings.
+        continue-on-error: true
         with:
           name: security-gate-semgrep-report
           path: semgrep.sarif
@@ -322,6 +336,13 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
         if: always()
+        # The report artifact is a convenience copy; the SARIF already reached
+        # code scanning in the previous step. An artifact-service error (seen
+        # 2026-09-08 on CarDuarte/password-manager main: "Failed to
+        # FinalizeArtifact ... (403) Forbidden: Error from intermediary" after
+        # a clean Gitleaks scan) must not turn a passing scan into a failed
+        # gate. The scan step above still fails the job on real findings.
+        continue-on-error: true
         with:
           name: security-gate-osv-report
           path: |
@@ -364,6 +385,13 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
         if: always()
+        # The report artifact is a convenience copy; the SARIF already reached
+        # code scanning in the previous step. An artifact-service error (seen
+        # 2026-09-08 on CarDuarte/password-manager main: "Failed to
+        # FinalizeArtifact ... (403) Forbidden: Error from intermediary" after
+        # a clean Gitleaks scan) must not turn a passing scan into a failed
+        # gate. The scan step above still fails the job on real findings.
+        continue-on-error: true
         with:
           name: security-gate-checkov-report
           path: checkov.sarif
